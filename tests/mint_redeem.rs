@@ -1,4 +1,4 @@
-use reflect_pow_mint_redeem::{derive_vault, quote_assets, quote_shares, Vault};
+use reflect_pow_mint_redeem::{derive_vault, quote_assets, quote_shares, Vault, NAV_SCALE};
 use solana_program_test::{processor, BanksClient, BanksClientError, ProgramTest};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -262,8 +262,9 @@ async fn deposit_mints_receipts_and_yield_raises_claim() {
     let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
     send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
     let vault = w.vault().await;
-    let shares = quote_shares(deposit, 0, 0).unwrap();
+    let shares = 2_000_000_000_000u64;
     assert_eq!(vault.total_shares, shares);
+    assert_eq!(vault.nav, NAV_SCALE);
     assert_eq!(w.supply().await, shares);
     assert_eq!(
         quote_assets(shares, vault.total_assets, vault.total_shares).unwrap(),
@@ -275,9 +276,17 @@ async fn deposit_mints_receipts_and_yield_raises_claim() {
     );
     send(&mut w.banks, &w.payer, &[donate, sync], &[]).await;
     let vault = w.vault().await;
-    let claim = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
-    assert!(claim > deposit);
     assert_eq!(vault.total_assets, deposit + 500_000);
+    assert_eq!(vault.nav, 1_249_999);
+    let claim = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
+    assert_eq!(claim, 2_499_999);
+    let user_usdc = w.user_usdc;
+    let redeem = w.redeem(shares);
+    send(&mut w.banks, &w.payer, &[redeem], &[]).await;
+    assert_eq!(w.amount(&user_usdc).await, claim);
+    let left = w.vault().await;
+    assert_eq!(left.total_shares, 0);
+    assert_eq!(left.total_assets, 1);
 }
 
 #[tokio::test]
@@ -333,20 +342,25 @@ async fn donation_before_first_mint_is_not_captured() {
     assert_eq!(w.amount(&user_receipt).await, 0);
 
     let deposit = 2_000_000u64;
-    let shares = quote_shares(deposit, donation, 0).unwrap();
+    let shares = 1_999_998u64;
+    assert_eq!(quote_shares(deposit, donation, 0).unwrap(), shares);
     let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
     send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
     assert_eq!(w.amount(&user_receipt).await, shares);
     let vault = w.vault().await;
-    let payout = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
-    assert!(payout <= deposit);
+    let payout = 1_999_999u64;
+    assert_eq!(
+        quote_assets(shares, vault.total_assets, vault.total_shares).unwrap(),
+        payout
+    );
+    assert!(payout < deposit);
     let user_usdc = w.user_usdc;
     let before = w.amount(&user_usdc).await;
     let redeem = w.redeem(shares);
     send(&mut w.banks, &w.payer, &[redeem], &[]).await;
     assert_eq!(w.amount(&user_usdc).await - before, payout);
     let left = w.vault().await;
-    assert!(left.total_assets >= donation);
+    assert_eq!(left.total_assets, donation + 1);
     assert_eq!(left.total_shares, 0);
     let vault_usdc = w.vault_usdc;
     assert_eq!(w.amount(&vault_usdc).await, left.total_assets);
@@ -370,13 +384,26 @@ async fn sync_after_donation_does_not_mint_one_for_one() {
     assert_eq!(w.amount(&vault_usdc).await, donation);
 
     let deposit = donation + 1;
-    let shares = quote_shares(deposit, donation, 0).unwrap();
+    let shares = 1_000_000u64;
+    assert_eq!(quote_shares(deposit, donation, 0).unwrap(), shares);
     let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
     send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
     let vault = w.vault().await;
-    let payout = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
-    assert!(payout <= deposit);
-    assert!(vault.total_assets - payout >= donation);
+    let payout = 1_000_001u64;
+    assert_eq!(
+        quote_assets(shares, vault.total_assets, vault.total_shares).unwrap(),
+        payout
+    );
+    let user_usdc = w.user_usdc;
+    let before = w.amount(&user_usdc).await;
+    let redeem = w.redeem(shares);
+    send(&mut w.banks, &w.payer, &[redeem], &[]).await;
+    assert_eq!(w.amount(&user_usdc).await - before, payout);
+    let left = w.vault().await;
+    assert_eq!(left.total_assets, donation);
+    assert_eq!(left.total_shares, 0);
+    let vault_usdc = w.vault_usdc;
+    assert_eq!(w.amount(&vault_usdc).await, donation);
 }
 
 #[tokio::test]

@@ -59,15 +59,18 @@ impl Vault {
     }
 
     fn refresh_nav(&mut self) -> ProgramResult {
-        self.nav = if self.total_shares == 0 {
-            NAV_SCALE
-        } else {
-            let nav = (self.total_assets as u128)
-                .checked_mul(NAV_SCALE as u128)
-                .ok_or(ProgramError::ArithmeticOverflow)?
-                / self.total_shares as u128;
-            u64::try_from(nav).map_err(|_| ProgramError::ArithmeticOverflow)?
-        };
+        // Price one nominal token (VIRTUAL_SHARES raw shares). At par this is
+        // NAV_SCALE. Dividing assets by the inflated raw supply floors a 25%
+        // yield back to 1, so the offset stays in the denominator.
+        let numer = (self.total_assets as u128)
+            .checked_add(VIRTUAL_ASSETS as u128)
+            .and_then(|v| v.checked_mul(VIRTUAL_SHARES as u128))
+            .and_then(|v| v.checked_mul(NAV_SCALE as u128))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let denom = (self.total_shares as u128)
+            .checked_add(VIRTUAL_SHARES as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        self.nav = u64::try_from(numer / denom).map_err(|_| ProgramError::ArithmeticOverflow)?;
         Ok(())
     }
 }
