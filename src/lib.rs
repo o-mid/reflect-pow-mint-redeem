@@ -20,6 +20,10 @@ use spl_token::{
 };
 
 pub const NAV_SCALE: u64 = 1_000_000;
+/// Virtual shares offset the empty-vault price so a donated balance is not
+/// captured by the first depositor. Matches a 6-decimal offset.
+pub const VIRTUAL_SHARES: u64 = 1_000_000;
+pub const VIRTUAL_ASSETS: u64 = 1;
 
 pub enum VaultError {
     NotInitialized = 1,
@@ -58,10 +62,11 @@ impl Vault {
         self.nav = if self.total_shares == 0 {
             NAV_SCALE
         } else {
-            self.total_assets
-                .checked_mul(NAV_SCALE)
+            let nav = (self.total_assets as u128)
+                .checked_mul(NAV_SCALE as u128)
                 .ok_or(ProgramError::ArithmeticOverflow)?
-                / self.total_shares
+                / self.total_shares as u128;
+            u64::try_from(nav).map_err(|_| ProgramError::ArithmeticOverflow)?
         };
         Ok(())
     }
@@ -99,6 +104,70 @@ pub fn process_instruction(
         2 => exchange(program_id, accounts, read_u64(rest)?, false),
         3 => sync_nav(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn mul_div(amount: u64, numer: u64, denom: u64) -> Result<u64, ProgramError> {
+    if denom == 0 {
+        return Err(VaultError::Insolvent.into());
+    }
+    let value = (amount as u128)
+        .checked_mul(numer as u128)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        / denom as u128;
+    u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+}
+
+pub fn quote_shares(
+    amount: u64,
+    total_assets: u64,
+    total_shares: u64,
+) -> Result<u64, ProgramError> {
+    if amount == 0 {
+        return Err(VaultError::ZeroAmount.into());
+    }
+    let shares = mul_div(
+        amount,
+        total_shares
+            .checked_add(VIRTUAL_SHARES)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        total_assets
+            .checked_add(VIRTUAL_ASSETS)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    )?;
+    if shares == 0 {
+        Err(VaultError::ZeroAmount.into())
+    } else {
+        Ok(shares)
+    }
+}
+
+pub fn quote_assets(
+    shares: u64,
+    total_assets: u64,
+    total_shares: u64,
+) -> Result<u64, ProgramError> {
+    if shares == 0 || total_shares == 0 || shares > total_shares {
+        return Err(if shares == 0 {
+            VaultError::ZeroAmount
+        } else {
+            VaultError::Insolvent
+        }
+        .into());
+    }
+    let assets = mul_div(
+        shares,
+        total_assets
+            .checked_add(VIRTUAL_ASSETS)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        total_shares
+            .checked_add(VIRTUAL_SHARES)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    )?;
+    if assets == 0 {
+        Err(VaultError::ZeroAmount.into())
+    } else {
+        Ok(assets.min(total_assets))
     }
 }
 
@@ -148,8 +217,17 @@ fn initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if vault_ai.key != &pda {
         return Err(VaultError::BadAccount.into());
     }
+    if receipt_mint.owner != &spl_token::id()
+        || usdc_mint.owner != &spl_token::id()
+        || vault_usdc.owner != &spl_token::id()
+    {
+        return Err(VaultError::BadAccount.into());
+    }
     let mint = Mint::unpack(&receipt_mint.data.borrow())?;
-    if mint.mint_authority != COption::Some(pda) {
+    if mint.mint_authority != COption::Some(pda)
+        || mint.supply != 0
+        || mint.freeze_authority != COption::None
+    {
         return Err(VaultError::BadAccount.into());
     }
     let usdc_acc = TokenAccount::unpack(&vault_usdc.data.borrow())?;
@@ -176,7 +254,7 @@ fn initialize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             usdc_mint: *usdc_mint.key,
             receipt_mint: *receipt_mint.key,
             vault_usdc: *vault_usdc.key,
-            total_assets: 0,
+            total_assets: usdc_acc.amount,
             total_shares: 0,
             nav: NAV_SCALE,
         },
@@ -219,22 +297,7 @@ fn exchange(
     let (bump, authority, usdc_mint) = (vault.bump, vault.authority, vault.usdc_mint);
     let seeds = signer_seeds(&authority, &usdc_mint, &bump);
     if is_mint {
-        if amount == 0 {
-            return Err(VaultError::ZeroAmount.into());
-        }
-        let shares = if vault.total_shares == 0 {
-            amount
-        } else if vault.total_assets == 0 {
-            return Err(VaultError::Insolvent.into());
-        } else {
-            amount
-                .checked_mul(vault.total_shares)
-                .ok_or(ProgramError::ArithmeticOverflow)?
-                / vault.total_assets
-        };
-        if shares == 0 {
-            return Err(VaultError::ZeroAmount.into());
-        }
+        let shares = quote_shares(amount, vault.total_assets, vault.total_shares)?;
         invoke(
             &token_ix::transfer(
                 token_program.key,
@@ -277,21 +340,7 @@ fn exchange(
             .checked_add(shares)
             .ok_or(ProgramError::ArithmeticOverflow)?;
     } else {
-        if amount == 0 || vault.total_shares == 0 || amount > vault.total_shares {
-            return Err(if amount == 0 {
-                VaultError::ZeroAmount
-            } else {
-                VaultError::Insolvent
-            }
-            .into());
-        }
-        let assets = amount
-            .checked_mul(vault.total_assets)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            / vault.total_shares;
-        if assets == 0 {
-            return Err(VaultError::ZeroAmount.into());
-        }
+        let assets = quote_assets(amount, vault.total_assets, vault.total_shares)?;
         invoke(
             &token_ix::burn(
                 token_program.key,

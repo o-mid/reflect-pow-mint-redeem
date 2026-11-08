@@ -1,5 +1,5 @@
-use reflect_pow_mint_redeem::{derive_vault, Vault, NAV_SCALE};
-use solana_program_test::{processor, BanksClient, ProgramTest};
+use reflect_pow_mint_redeem::{derive_vault, quote_assets, quote_shares, Vault};
+use solana_program_test::{processor, BanksClient, BanksClientError, ProgramTest};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
@@ -17,6 +17,17 @@ async fn send(banks: &mut BanksClient, payer: &Keypair, ixs: &[Instruction], ext
     signers.extend_from_slice(extra);
     tx.sign(&signers, hash);
     banks.process_transaction(tx).await.unwrap();
+}
+
+async fn try_send(
+    banks: &mut BanksClient,
+    payer: &Keypair,
+    ixs: &[Instruction],
+) -> Result<(), BanksClientError> {
+    let hash = banks.get_latest_blockhash().await.unwrap();
+    let mut tx = Transaction::new_with_payer(ixs, Some(&payer.pubkey()));
+    tx.sign(&[payer], hash);
+    banks.process_transaction(tx).await
 }
 
 async fn create(
@@ -63,6 +74,10 @@ struct World {
 }
 
 async fn world() -> World {
+    world_with(0).await
+}
+
+async fn world_with(prefund: u64) -> World {
     let program_id = Pubkey::new_unique();
     let mut test = ProgramTest::new(
         "reflect_pow_mint_redeem",
@@ -131,6 +146,23 @@ async fn world() -> World {
                 &owner,
             )
             .unwrap(),
+        )
+        .await;
+    }
+    if prefund > 0 {
+        send(
+            &mut banks,
+            &payer,
+            &[spl_token::instruction::mint_to(
+                &spl_token::id(),
+                &usdc_mint.pubkey(),
+                &vault_usdc.pubkey(),
+                &payer.pubkey(),
+                &[],
+                prefund,
+            )
+            .unwrap()],
+            &[],
         )
         .await;
     }
@@ -224,31 +256,28 @@ impl World {
 }
 
 #[tokio::test]
-async fn deposit_mints_receipts_and_yield_raises_nav() {
+async fn deposit_mints_receipts_and_yield_raises_claim() {
     let mut w = world().await;
-    let (fund, deposit) = (w.fund(2_000_000), w.deposit(2_000_000));
-    send(&mut w.banks, &w.payer, &[fund, deposit], &[]).await;
+    let deposit = 2_000_000u64;
+    let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
+    send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
     let vault = w.vault().await;
-    let supply = w.supply().await;
+    let shares = quote_shares(deposit, 0, 0).unwrap();
+    assert_eq!(vault.total_shares, shares);
+    assert_eq!(w.supply().await, shares);
     assert_eq!(
-        (vault.total_shares, vault.nav, supply),
-        (2_000_000, NAV_SCALE, 2_000_000)
+        quote_assets(shares, vault.total_assets, vault.total_shares).unwrap(),
+        deposit
     );
-    let nav = vault.nav;
     let (donate, sync) = (
         w.donate(500_000),
         sync_nav_ix(&w.program_id, &w.vault, &w.vault_usdc),
     );
     send(&mut w.banks, &w.payer, &[donate, sync], &[]).await;
     let vault = w.vault().await;
-    assert!(vault.nav > nav);
-    assert_eq!((vault.total_assets, vault.nav), (2_500_000, 1_250_000));
-    let (fund, deposit) = (w.fund(1_250_000), w.deposit(1_250_000));
-    send(&mut w.banks, &w.payer, &[fund, deposit], &[]).await;
-    let shares = w.vault().await.total_shares;
-    let user_receipt = w.user_receipt;
-    assert_eq!(shares, 3_000_000);
-    assert_eq!(w.amount(&user_receipt).await, 3_000_000);
+    let claim = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
+    assert!(claim > deposit);
+    assert_eq!(vault.total_assets, deposit + 500_000);
 }
 
 #[tokio::test]
@@ -262,8 +291,8 @@ async fn redeem_burns_receipts_and_pays_pro_rata() {
     );
     send(&mut w.banks, &w.payer, &[donate, sync], &[]).await;
     let vault = w.vault().await;
-    let shares = 1_000_000u64;
-    let expected = shares * vault.total_assets / vault.total_shares;
+    let shares = vault.total_shares / 2;
+    let expected = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
     let user_usdc = w.user_usdc;
     let usdc_before = w.amount(&user_usdc).await;
     let supply_before = w.supply().await;
@@ -272,8 +301,8 @@ async fn redeem_burns_receipts_and_pays_pro_rata() {
     assert_eq!(w.amount(&user_usdc).await - usdc_before, expected);
     assert_eq!(supply_before - w.supply().await, shares);
     let vault = w.vault().await;
-    let claim = vault.total_shares as u128 * vault.nav as u128 / NAV_SCALE as u128;
-    assert!(claim <= vault.total_assets as u128);
+    let rest = quote_assets(vault.total_shares, vault.total_assets, vault.total_shares).unwrap();
+    assert!(rest <= vault.total_assets);
     let vault_usdc = w.vault_usdc;
     assert_eq!(w.amount(&vault_usdc).await, vault.total_assets);
 
@@ -286,6 +315,199 @@ async fn redeem_burns_receipts_and_pays_pro_rata() {
     let vault = w.vault().await;
     assert_eq!(vault.total_assets, assets_before);
     assert_eq!(w.supply().await, vault.total_shares);
+}
+
+#[tokio::test]
+async fn donation_before_first_mint_is_not_captured() {
+    let donation = 1_000_000u64;
+    let mut w = world_with(donation).await;
+    let booked = w.vault().await;
+    assert_eq!((booked.total_assets, booked.total_shares), (donation, 0));
+
+    let (fund_dust, dust) = (w.fund(1), w.deposit(1));
+    assert!(try_send(&mut w.banks, &w.payer, &[fund_dust, dust])
+        .await
+        .is_err());
+    assert_eq!(w.vault().await.total_assets, donation);
+    let user_receipt = w.user_receipt;
+    assert_eq!(w.amount(&user_receipt).await, 0);
+
+    let deposit = 2_000_000u64;
+    let shares = quote_shares(deposit, donation, 0).unwrap();
+    let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
+    send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
+    assert_eq!(w.amount(&user_receipt).await, shares);
+    let vault = w.vault().await;
+    let payout = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
+    assert!(payout <= deposit);
+    let user_usdc = w.user_usdc;
+    let before = w.amount(&user_usdc).await;
+    let redeem = w.redeem(shares);
+    send(&mut w.banks, &w.payer, &[redeem], &[]).await;
+    assert_eq!(w.amount(&user_usdc).await - before, payout);
+    let left = w.vault().await;
+    assert!(left.total_assets >= donation);
+    assert_eq!(left.total_shares, 0);
+    let vault_usdc = w.vault_usdc;
+    assert_eq!(w.amount(&vault_usdc).await, left.total_assets);
+}
+
+#[tokio::test]
+async fn sync_after_donation_does_not_mint_one_for_one() {
+    let mut w = world().await;
+    let donation = 1_000_000u64;
+    let (donate, sync) = (
+        w.donate(donation),
+        sync_nav_ix(&w.program_id, &w.vault, &w.vault_usdc),
+    );
+    send(&mut w.banks, &w.payer, &[donate, sync], &[]).await;
+    assert_eq!(w.vault().await.total_shares, 0);
+    let (fund_dust, dust) = (w.fund(1), w.deposit(1));
+    assert!(try_send(&mut w.banks, &w.payer, &[fund_dust, dust])
+        .await
+        .is_err());
+    let vault_usdc = w.vault_usdc;
+    assert_eq!(w.amount(&vault_usdc).await, donation);
+
+    let deposit = donation + 1;
+    let shares = quote_shares(deposit, donation, 0).unwrap();
+    let (fund, mint) = (w.fund(deposit), w.deposit(deposit));
+    send(&mut w.banks, &w.payer, &[fund, mint], &[]).await;
+    let vault = w.vault().await;
+    let payout = quote_assets(shares, vault.total_assets, vault.total_shares).unwrap();
+    assert!(payout <= deposit);
+    assert!(vault.total_assets - payout >= donation);
+}
+
+#[tokio::test]
+async fn initialize_rejects_seeded_or_freezable_receipt_mint() {
+    assert!(bad_receipt_mint(true, false).await.is_err());
+    assert!(bad_receipt_mint(false, true).await.is_err());
+}
+
+async fn bad_receipt_mint(seed_supply: bool, freeze: bool) -> Result<(), BanksClientError> {
+    let program_id = Pubkey::new_unique();
+    let mut test = ProgramTest::new(
+        "reflect_pow_mint_redeem",
+        program_id,
+        processor!(reflect_pow_mint_redeem::process_instruction),
+    );
+    test.add_program(
+        "spl_token",
+        spl_token::id(),
+        processor!(spl_token::processor::Processor::process),
+    );
+    let (mut banks, payer, _) = test.start().await;
+    let usdc_mint = Keypair::new();
+    let receipt_mint = Keypair::new();
+    let vault_usdc = Keypair::new();
+    let user_receipt = Keypair::new();
+    let (vault, _) = derive_vault(&program_id, &payer.pubkey(), &usdc_mint.pubkey());
+    let freeze_auth = if freeze { Some(payer.pubkey()) } else { None };
+    let mint_authority = if seed_supply { payer.pubkey() } else { vault };
+    create(
+        &mut banks,
+        &payer,
+        &usdc_mint,
+        Mint::LEN,
+        &spl_token::id(),
+        spl_token::instruction::initialize_mint(
+            &spl_token::id(),
+            &usdc_mint.pubkey(),
+            &payer.pubkey(),
+            None,
+            6,
+        )
+        .unwrap(),
+    )
+    .await;
+    create(
+        &mut banks,
+        &payer,
+        &receipt_mint,
+        Mint::LEN,
+        &spl_token::id(),
+        spl_token::instruction::initialize_mint(
+            &spl_token::id(),
+            &receipt_mint.pubkey(),
+            &mint_authority,
+            freeze_auth.as_ref(),
+            6,
+        )
+        .unwrap(),
+    )
+    .await;
+    create(
+        &mut banks,
+        &payer,
+        &vault_usdc,
+        TokenAccount::LEN,
+        &spl_token::id(),
+        spl_token::instruction::initialize_account3(
+            &spl_token::id(),
+            &vault_usdc.pubkey(),
+            &usdc_mint.pubkey(),
+            &vault,
+        )
+        .unwrap(),
+    )
+    .await;
+    if seed_supply {
+        create(
+            &mut banks,
+            &payer,
+            &user_receipt,
+            TokenAccount::LEN,
+            &spl_token::id(),
+            spl_token::instruction::initialize_account3(
+                &spl_token::id(),
+                &user_receipt.pubkey(),
+                &receipt_mint.pubkey(),
+                &payer.pubkey(),
+            )
+            .unwrap(),
+        )
+        .await;
+        send(
+            &mut banks,
+            &payer,
+            &[
+                spl_token::instruction::mint_to(
+                    &spl_token::id(),
+                    &receipt_mint.pubkey(),
+                    &user_receipt.pubkey(),
+                    &payer.pubkey(),
+                    &[],
+                    1,
+                )
+                .unwrap(),
+                spl_token::instruction::set_authority(
+                    &spl_token::id(),
+                    &receipt_mint.pubkey(),
+                    Some(&vault),
+                    spl_token::instruction::AuthorityType::MintTokens,
+                    &payer.pubkey(),
+                    &[],
+                )
+                .unwrap(),
+            ],
+            &[],
+        )
+        .await;
+    }
+    try_send(
+        &mut banks,
+        &payer,
+        &[initialize_ix(
+            &program_id,
+            &payer.pubkey(),
+            &vault,
+            &usdc_mint.pubkey(),
+            &receipt_mint.pubkey(),
+            &vault_usdc.pubkey(),
+        )],
+    )
+    .await
 }
 
 fn ix(program_id: &Pubkey, accounts: Vec<AccountMeta>, data: Vec<u8>) -> Instruction {
